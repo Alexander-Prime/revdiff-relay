@@ -26,13 +26,9 @@
             # against the real thing, not only to review this repo's own diffs.
             revdiff.packages.${system}.default
 
-            # Runtime dependencies of scripts/flush.sh. launch.sh resolves both
-            # to absolute paths from whatever shell it runs in, so they have to
-            # be present there — this shell.
-            pkgs.jq
-            pkgs.socat
-
-            pkgs.shellcheck
+            # Type-checks hooks/ against the declarations Claude Code writes
+            # into .claude-plugin/types/ when it loads the plugin.
+            pkgs.typescript
           ];
         };
       }
