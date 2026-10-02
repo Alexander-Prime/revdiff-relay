@@ -15,7 +15,7 @@ Claude doesn't wait on the pane or poll it, and doesn't spend a turn until a flu
 
 ## Requirements
 
-- `revdiff` on PATH, with the `flush_output` action (`O`)
+- `revdiff` on PATH, with `--post-flush-command` and the `flush_output` action (`O`)
 - Zellij with floating pane support, and Claude Code running inside a Zellij session
 - A Claude Code release with mods (function hooks), on macOS or Linux. Developed against
   v2.1.287; the mod API is early access and may move between releases
@@ -59,27 +59,31 @@ In the pane:
 ## How it works
 
 The plugin is a mod: a hooks module, `hooks/register.ts`, that Claude Code loads alongside
-the session. revdiff writes each flush to a file, and Claude Code tells the module when that
-file changes.
+the session. A flush travels revdiff → `scripts/flush.sh` → FIFO → the hooks module → your
+session.
 
-- When the session starts, the module asks Claude Code to watch
-  `/tmp/revdiff-<session-id>/annotations`, creating it if needed, and registers `/revdiff`.
-- `/revdiff` empties that file, so nothing from an earlier review carries over, and opens
-  the floating pane with revdiff's `--output` pointed at it. The pane is named after the
-  session's title, or the directory and the start of the session ID when there's no title
-  yet, so you can tell which conversation it belongs to.
-- On each `O`, revdiff rewrites the file with the full current annotation set. When Claude
-  Code reports the change, the module reads the file and submits the set prefixed
-  `Annotations from revdiff:`. It's submitted as your own words, so Claude reads it without
-  the frame Claude Code puts around plugin messages; the transcript still records that it
-  came from the plugin. A flush that lands while Claude is busy waits for the session to go
-  idle and then starts a turn of its own, in order. Flushing the same set again sends it
-  again.
-- Delivery takes a moment after `O`: Claude Code waits for the file to settle before
-  reporting the change, which keeps it from reading a half-written set.
-- The watch belongs to the session. After `/clear` — which starts a new session — a pane
-  opened before it is no longer heard, and its pane name shows the old title. Run
-  `/revdiff` again in the new session.
+- When the session starts, the module registers `/revdiff` and starts a task that sleeps
+  until there's a review to read.
+- `/revdiff` points revdiff's `--output` at `/tmp/revdiff-<session-id>/annotations`, creates
+  a FIFO beside it, hands the FIFO to that task and opens the floating pane. The pane is
+  named after the session's title, or the directory and the start of the session ID when
+  there's no title, so you can tell which conversation it belongs to.
+- revdiff runs `flush.sh` after each `O`, in the Zellij server's environment. It exits
+  silently on an empty annotation set; otherwise it writes the set plus a NUL terminator to
+  the FIFO, bounded by a timeout so a dead reader can't freeze the TUI.
+- The task runs `cat` on the FIFO as a child of Claude Code, reads one annotation set per
+  flush and submits it prefixed `Annotations from revdiff:`. It's submitted as your own
+  words, so Claude reads it without the frame Claude Code puts around plugin messages; the
+  transcript still records that it came from the plugin. A flush that lands while Claude is
+  busy waits for the session to go idle and then starts a turn of its own, in order. One
+  reader runs per session: a new `/revdiff` replaces it, a plugin reload picks the open FIFO
+  back up, and Claude Code ends it with the session.
+- Delivery uses only the mod API's own events. Claude Code's older `classic.*` hook events
+  are skipped for user-installed plugins wherever an organization manages Claude Code, so
+  the plugin reads the session title from them but doesn't depend on them; under managed
+  settings the pane gets the fallback name.
+- A pane belongs to the session that opened it. After `/clear`, which starts a new session,
+  run `/revdiff` again.
 - Annotation lifecycle is revdiff's, not the plugin's. `R` drops the annotations on lines the
   reload changed and keeps the others, so a comment that comes back around is one you left
   standing on purpose. The plugin does no diffing and keeps no snapshot, which is also why
@@ -96,6 +100,9 @@ type-checks `hooks/`.
 
 ### Debugging
 
-If flushes seem to vanish, check that the file changes: `/tmp/revdiff-<session-id>/annotations`
-should hold your annotations after `O`. A submit Claude Code refuses is logged to its debug
-log (`claude --debug`) under the plugin's name.
+revdiff reports a post-flush-command failure on its own stdout, not in the TUI, and the pane
+runs with `--close-on-exit`, so that output dies with the pane. So `flush.sh` logs each flush
+and hand-off to `flush.log` beside the annotations, in `/tmp/revdiff-<session-id>/`. The
+reader logs to Claude Code's debug log (`claude --debug`, written to
+`~/.claude/debug/<session-id>.txt`) under the plugin's name, as does a hook that Claude Code
+skips or refuses. If flushes seem to vanish, read those first.

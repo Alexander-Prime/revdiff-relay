@@ -2,10 +2,9 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-const ENV = { ZELLIJ: '0', EDITOR: 'nvim', PATH: '/nope:/bin' }
-const ANNOTATIONS = '/tmp/revdiff-sess/annotations'
+const ZELLIJ_ENV = { ZELLIJ: '0', EDITOR: 'nvim', PATH: '/nope:/bin' }
+const FIFO = '/tmp/revdiff-sess/flush.pipe'
 
-// Runs /revdiff as the person typing it would.
 const revdiff = ($: Engine, args: string) =>
   $.command.run({
     command: 'revdiff',
@@ -14,129 +13,164 @@ const revdiff = ($: Engine, args: string) =>
     presentation: { isFullscreen: false, columns: 120 },
   })
 
-// Starts the session the way Claude Code does: the engine's event, then the
-// SessionStart hook event whose result carries the watch paths.
-async function startSession($: Engine, title?: string) {
-  await $.session.start({ cwd: '/work/proj', surface: 'terminal', isInteractive: true })
-  return $.classic.SessionStart({ source: 'startup', session_id: 'sess', session_title: title })
+const startSession = ($: Engine) =>
+  $.session.start({ cwd: '/work/proj', surface: 'terminal', isInteractive: true })
+
+const paneName = (runs: string[][]) => {
+  const zellij = runs.find(argv => argv[0] === 'zellij') ?? []
+  return zellij[zellij.indexOf('--name') + 1]
 }
 
-const flush = ($: Engine, file_path = ANNOTATIONS) =>
-  $.classic.FileChanged({ session_id: 'sess', file_path, event: 'change' })
-
-// Answers everything beneath the plugin from memory: a file system of one
-// directory, the host commands it runs, and the prompts it submits.
-function host(on: On) {
-  const files = new Map<string, string>()
+function host(on: On, { hasFifo = false } = {}) {
   const runs: string[][] = []
-  const submitted: { text: string; asUser?: boolean }[] = []
+  const submitted: string[] = []
+  const readers: { argv: readonly string[]; release: () => void }[] = []
 
   on('ui.log', async () => ({ value: undefined }))
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('classic.SessionStart', async () => ({}))
-  on('classic.FileChanged', async () => ({}))
+  on('classic.UserPromptSubmit', async () => ({}))
   on('command.register', async (_$, e) => ({ value: { command: e.name } }))
   on('session.id', async () => ({ value: 'sess' }))
   on('session.cwd', async () => ({ value: '/work/proj' }))
-  on('fs.exists', async (_$, e) => ({ value: files.has(e.path) }))
-  on('fs.read', async (_$, e) => ({ value: files.get(e.path) ?? '' }))
-  on('fs.write', async (_$, e) => {
-    files.set(e.path, e.text)
-    return { value: undefined }
-  })
   on('fs.stat', async (_$, e) => {
-    if (e.path !== '/bin/revdiff') return { deny: 'ENOENT' }
-    return { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
+    if (e.path === '/bin/revdiff') return { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
+    if (e.path === FIFO && hasFifo) return { value: { kind: 'other' as const, size: 0, mtimeMs: 0, isLink: false } }
+    return { deny: 'ENOENT' }
   })
   on('process.run', async (_$, e) => {
     runs.push([...e.argv])
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('prompt.submit', async (_$, e) => {
-    submitted.push({ text: e.text, asUser: e.origin.kind === 'plugin' ? e.origin.asUser : undefined })
+    expect(e.origin).toEqual({ kind: 'plugin', name: 'revdiff-relay', asUser: true })
+    submitted.push(e.text)
     return { text: e.text }
   })
+  on('process.spawn', async function* (_$, e) {
+    let release = () => {}
+    const gate = new Promise<void>(resolve => (release = resolve))
+    readers.push({ argv: e.argv, release })
+    // A flush split across two pieces, an empty flush, then a gated second flush.
+    yield { stream: 'stdout' as const, text: '## a.go:1 (+)\nfirst' }
+    yield { stream: 'stdout' as const, text: ' half\0  \n\0' }
+    await gate
+    yield { stream: 'stdout' as const, text: '## b.go (+)\nsecond\0' }
+    return { value: { code: 0, signal: null } }
+  })
 
-  return { files, runs, submitted }
+  return { runs, submitted, readers }
 }
 
-test('the session watches its annotations file, created empty', async ($, on) => {
-  mock.env(on, ENV)
-  const { files } = host(on)
-
-  const result = await startSession($)
-  expect(result.watchPaths).toEqual([ANNOTATIONS])
-  expect(files.get(ANNOTATIONS)).toBe('')
-})
-
-test('each flush arrives as one unframed prompt', async ($, on) => {
-  mock.env(on, ENV)
+test('each flush arrives as one prompt; empty flushes are dropped', async ($, on) => {
+  mock.env(on, ZELLIJ_ENV)
   const clock = mock.clock(on)
-  const { files, submitted } = host(on)
+  const { submitted, readers } = host(on)
   await startSession($)
 
-  files.set(ANNOTATIONS, '## a.go:1 (+)\nfirst')
-  await flush($)
-  files.set(ANNOTATIONS, '## a.go:1 (+)\nfirst')
-  await flush($)
-  await clock.settle()
-
-  // The same set flushed twice is the reviewer re-sending it, so both arrive.
-  expect(submitted).toEqual([
-    { text: 'Annotations from revdiff:\n\n## a.go:1 (+)\nfirst', asUser: true },
-    { text: 'Annotations from revdiff:\n\n## a.go:1 (+)\nfirst', asUser: true },
-  ])
-})
-
-test('an empty file and other files are ignored', async ($, on) => {
-  mock.env(on, ENV)
-  const clock = mock.clock(on)
-  const { files, submitted } = host(on)
-  await startSession($)
-
-  files.set(ANNOTATIONS, ' \n')
-  await flush($)
-  files.set('/elsewhere', 'text')
-  await flush($, '/elsewhere')
-  await clock.settle()
-
-  expect(submitted).toEqual([])
-})
-
-test('/revdiff empties the file and opens a pane named for the session', async ($, on) => {
-  mock.env(on, ENV)
-  const { files, runs } = host(on)
-  await startSession($, 'Review the relay')
-  files.set(ANNOTATIONS, 'left over')
-
-  const ran = await revdiff($, 'main --staged')
+  const ran = await revdiff($, '@-')
   expect(ran.text).toContain('revdiff is open')
   expect(ran.context?.[0]).toContain('Annotations from revdiff:')
-  expect(files.get(ANNOTATIONS)).toBe('')
+  await clock.settle()
+  expect(submitted).toEqual(['Annotations from revdiff:\n\n## a.go:1 (+)\nfirst half'])
 
-  const zellij = runs.find(argv => argv[0] === 'zellij') ?? []
-  expect(zellij[zellij.indexOf('--name') + 1]).toBe('revdiff: Review the relay')
-  expect(zellij.slice(zellij.indexOf('--') + 1)).toEqual([
-    '/usr/bin/env', 'EDITOR=nvim', '/bin/revdiff', `--output=${ANNOTATIONS}`, 'main', '--staged',
-  ])
+  readers[0]?.release()
+  await clock.settle()
+  expect(submitted).toHaveLength(2)
+  expect(submitted[1]).toBe('Annotations from revdiff:\n\n## b.go (+)\nsecond')
 })
 
-test('an untitled session names the pane by directory and session id', async ($, on) => {
-  mock.env(on, ENV)
-  const { runs } = host(on)
+test('the pane gets the flush hook, the editor and the arguments', async ($, on) => {
+  mock.env(on, ZELLIJ_ENV)
+  const clock = mock.clock(on)
+  const { runs, readers } = host(on)
+  await startSession($)
+
+  await revdiff($, 'main --staged')
+  await clock.settle()
+  expect(readers[0]?.argv).toEqual(['sh', '-c', 'exec cat <>"$1"', 'sh', FIFO])
+
+  const zellij = runs.find(argv => argv[0] === 'zellij') ?? []
+  const pane = zellij.slice(zellij.indexOf('--') + 1)
+  expect(pane[0]).toBe('/usr/bin/env')
+  expect(pane[1]).toBe('EDITOR=nvim')
+  expect(pane[2]).toBe('/bin/revdiff')
+  expect(pane[3]).toBe('--output=/tmp/revdiff-sess/annotations')
+  expect(pane[4]).toMatch(/^--post-flush-command='.*\/scripts\/flush\.sh' --annotations '\/tmp\/revdiff-sess\/annotations' --fifo '\/tmp\/revdiff-sess\/flush\.pipe'$/)
+  expect(pane.slice(5)).toEqual(['main', '--staged'])
+})
+
+test('a new review stops the previous reader', async ($, on) => {
+  mock.env(on, ZELLIJ_ENV)
+  const clock = mock.clock(on)
+  const { submitted, readers } = host(on)
   await startSession($)
 
   await revdiff($, '')
-  const zellij = runs.find(argv => argv[0] === 'zellij') ?? []
-  expect(zellij[zellij.indexOf('--name') + 1]).toBe('revdiff: proj · sess')
+  await clock.settle()
+  await revdiff($, '')
+  await clock.settle()
+  expect(readers).toHaveLength(2)
+  expect(submitted).toHaveLength(2)
+
+  readers[0]?.release()
+  await clock.settle()
+  expect(submitted).toHaveLength(2)
+  readers[1]?.release()
+  await clock.settle()
+  expect(submitted).toHaveLength(3)
+})
+
+test('a reload picks up the FIFO a still-open pane flushes into', async ($, on) => {
+  mock.env(on, ZELLIJ_ENV)
+  const clock = mock.clock(on)
+  const { submitted, readers } = host(on, { hasFifo: true })
+  await startSession($)
+  await clock.settle()
+
+  expect(readers[0]?.argv).toEqual(['sh', '-c', 'exec cat <>"$1"', 'sh', FIFO])
+  expect(submitted).toHaveLength(1)
+})
+
+test('a pane opened before /clear stops delivering', async ($, on) => {
+  mock.env(on, ZELLIJ_ENV)
+  const clock = mock.clock(on)
+  const { submitted, readers } = host(on)
+  on('session.end', async (_$, e) => ({ sessionId: e.sessionId }))
+  await startSession($)
+
+  await revdiff($, '')
+  await clock.settle()
+  expect(submitted).toHaveLength(1)
+
+  await $.session.end({ reason: 'clear', sessionId: 'sess', resume: { id: 'sess' } })
+  readers[0]?.release()
+  await clock.settle()
+  expect(submitted).toHaveLength(1)
+})
+
+test('the pane is named for the session title once one is known', async ($, on) => {
+  mock.env(on, ZELLIJ_ENV)
+  const { runs } = host(on)
+  await startSession($)
+  await $.classic.SessionStart({ source: 'startup', session_id: 'sess' })
+
+  await revdiff($, '')
+  expect(paneName(runs)).toBe('revdiff: proj · sess')
+
+  await $.classic.UserPromptSubmit({ session_id: 'sess', prompt: 'hi', session_title: 'Review the relay' })
+  runs.length = 0
+  await revdiff($, '')
+  expect(paneName(runs)).toBe('revdiff: Review the relay')
 })
 
 test('outside Zellij nothing is started', async ($, on) => {
   mock.env(on, { PATH: '/bin' })
-  const { runs } = host(on)
+  const { runs, readers } = host(on)
   await startSession($)
 
   const ran = await revdiff($, '')
   expect(ran.text).toBe('Not inside a Zellij session.')
   expect(runs).toEqual([])
+  expect(readers).toEqual([])
 })

@@ -26,6 +26,7 @@
             # against the real thing, not only to review this repo's own diffs.
             revdiff.packages.${system}.default
 
+            pkgs.shellcheck
             # Type-checks hooks/ against the declarations Claude Code writes
             # into .claude-plugin/types/ when it loads the plugin.
             pkgs.typescript
